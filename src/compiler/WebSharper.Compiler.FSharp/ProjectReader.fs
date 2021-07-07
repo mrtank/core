@@ -1031,8 +1031,6 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
     for s in asmAnnot.JavaScriptExportTypesFilesAndAssemblies do
         comp.AddJavaScriptExport (ExportByName s)
 
-    comp.CustomTypesReflector <- A.reflectCustomType
-    
     let lookupAssembly =
         lazy
         Map [
@@ -1133,6 +1131,138 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
                 m.Attributes |> readAttributes
             ) 
         )
+
+    let reflectCustomType (typeDef: TypeDefinition): CustomTypeInfo =
+        let cls = lookupTypeDefinition(typeDef)
+        let branchOnType (entity: FSharpEntity) =
+            if entity.IsFSharpUnion then
+
+                let usesNull =
+                    entity.UnionCases.Count < 4 // see TaggingThresholdFixedConstant in visualfsharp/src/ilx/EraseUnions.fs
+                    && entity.Attributes |> CodeReader.hasCompilationRepresentation CompilationRepresentationFlags.UseNullAsTrueValue
+                    && entity.UnionCases |> Seq.exists (fun c -> c.Fields.Count = 0)
+
+                let mutable nullCase = usesNull 
+
+                let constants = HashSet() 
+
+                let cases =
+                    entity.UnionCases
+                    |> Seq.mapi (fun i case ->
+                        let constantCase v =
+                            if constants.Add(v) then
+                                ConstantFSharpUnionCase v
+                            else
+                                comp.AddError(Some (CodeReader.getRange case.DeclarationLocation), 
+                                    SourceError "Union case translated constant value is a duplicate")
+                                ConstantFSharpUnionCase (String "$$ERROR$$")
+                        let cAnnot = sr.AttributeReader.GetMemberAnnot(rootTypeAnnot, case.Attributes)
+                        let kind =
+                            let argumentless = case.Fields.Count = 0
+                            if nullCase && argumentless then
+                                nullCase <- false
+                                constantCase Null
+                            else
+                            match cAnnot.Kind with
+                            | Some (A.MemberKind.Constant v) -> 
+                                constantCase v
+                            | _ ->
+                                if argumentless && notForcedNotJavaScript then
+                                    let caseField = Definitions.SingletonUnionCase case.CompiledName
+                                    let expr = CopyCtor(typeDef, Object [ "$", Value (Int i) ])
+                                    let a = { A.MemberAnnotation.BasicPureJavaScript with Name = Some case.Name }
+                                    clsMembers.Add (NotResolvedMember.Method (caseField, (getUnresolved a N.Static false None expr)))
+                                    SingletonFSharpUnionCase
+                                else
+                                    NormalFSharpUnionCase (
+                                        case.Fields
+                                        |> Seq.map (fun f ->
+                                            {
+                                                Name = f.Name
+                                                UnionFieldType = sr.ReadType clsTparams.Value f.FieldType
+                                                DateTimeFormat = 
+                                                    cAnnot.DateTimeFormat 
+                                                    |> List.tryPick (fun (target, format) -> if target = Some f.Name then Some format else None)
+                                            }
+                                        )
+                                        |> List.ofSeq
+                                    )
+                        let staticIs =
+                            not usesNull || not (
+                                case.Attributes
+                                |> CodeReader.hasCompilationRepresentation CompilationRepresentationFlags.Instance
+                            )
+                        {
+                            Name = case.Name
+                            JsonName = cAnnot.Name
+                            Kind = kind
+                            StaticIs = staticIs
+                        }
+                    )
+                    |> List.ofSeq
+                
+                FSharpUnionInfo {
+                    Cases = cases
+                    NamedUnionCases = rootTypeAnnot.NamedUnionCases
+                    HasNull = constants.Contains(Null)
+                }
+            else if entity.IsFSharpRecord then
+                entity.FSharpFields |> Seq.map (fun f ->
+                    let fAnnot = sr.AttributeReader.GetMemberAnnot(rootTypeAnnot, Seq.append f.FieldAttributes f.PropertyAttributes)
+                    let isOpt = fAnnot.Kind = Some A.MemberKind.OptionalField && CodeReader.isOption f.FieldType
+                    let fTyp = sr.ReadType clsTparams.Value f.FieldType
+
+                    {
+                        Name = f.Name
+                        JSName = match fAnnot.Name with Some n -> n | _ -> f.Name // TODO : set in resolver instead
+                        RecordFieldType = fTyp
+                        DateTimeFormat = fAnnot.DateTimeFormat |> List.tryHead |> Option.map snd
+                        Optional = isOpt
+                        IsMutable = f.IsMutable
+                    }
+                )
+                |> List.ofSeq |> FSharpRecordInfo    
+
+                //FST.GetRecordFields(t, Reflection.AllMethodsFlags)
+                //|> Seq.map (fun f ->
+                //    let annot = attrReader.GetMemberAnnot(tAnnot, f.GetCustomAttributesData()) 
+                //    let isOpt = 
+                //        annot.Kind = Some MemberKind.OptionalField 
+                //        && f.PropertyType.IsGenericType 
+                //        && f.PropertyType.GetGenericTypeDefinition() = typedefof<option<_>>
+                //    {
+                //        Name = f.Name
+                //        JSName = match annot.Name with Some n -> n | _ -> f.Name
+                //        RecordFieldType = Reflection.ReadType f.PropertyType
+                //        DateTimeFormat = annot.DateTimeFormat |> List.tryHead |> Option.map snd
+                //        Optional = isOpt
+                //        IsMutable = f.CanWrite
+                //    } : M.FSharpRecordFieldInfo
+                //)
+                //|> List.ofSeq |> M.FSharpRecordInfo
+
+                //CustomTypeInfo.FSharpRecordInfo 
+                //{
+                //    Name = f.Name
+                //    JSName = match annot.Name with Some n -> n | _ -> f.Name
+                //    RecordFieldType = Reflection.ReadType f.PropertyType
+                //    DateTimeFormat = annot.DateTimeFormat |> List.tryHead |> Option.map snd
+                //    Optional = isOpt
+                //    IsMutable = f.CanWrite
+                //} : CustomTypeInfo.FSharpRecordInfo
+            else if entity.IsEnum then
+                CustomTypeInfo.EnumInfo typeDef
+            // Union
+            else
+                CustomTypeInfo.EnumInfo typeDef
+
+        cls
+        |> Option.map branchOnType
+        |> Option.defaultValue CustomTypeInfo.NotCustomType
+
+    comp.CustomTypesReflector <- reflectCustomType
+        
+    A.reflectCustomType
 
     comp.LookupTypeAttributes <- lookupTypeAttributes
     comp.LookupFieldAttributes <- lookupFieldAttributes 

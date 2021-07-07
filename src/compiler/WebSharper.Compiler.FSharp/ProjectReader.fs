@@ -1135,6 +1135,9 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
     let reflectCustomType (typeDef: TypeDefinition): CustomTypeInfo =
         let cls = lookupTypeDefinition(typeDef)
         let branchOnType (entity: FSharpEntity) =
+            let clsTparams =
+                lazy 
+                entity.GenericParameters |> Seq.mapi (fun i p -> p.Name, i) |> Map.ofSeq
             if entity.IsFSharpUnion then
 
                 let usesNull =
@@ -1148,13 +1151,11 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
 
                 let cases =
                     entity.UnionCases
-                    |> Seq.mapi (fun i case ->
+                    |> Seq.map (fun case ->
                         let constantCase v =
                             if constants.Add(v) then
                                 ConstantFSharpUnionCase v
                             else
-                                comp.AddError(Some (CodeReader.getRange case.DeclarationLocation), 
-                                    SourceError "Union case translated constant value is a duplicate")
                                 ConstantFSharpUnionCase (String "$$ERROR$$")
                         let cAnnot = sr.AttributeReader.GetMemberAnnot(rootTypeAnnot, case.Attributes)
                         let kind =
@@ -1167,11 +1168,7 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
                             | Some (A.MemberKind.Constant v) -> 
                                 constantCase v
                             | _ ->
-                                if argumentless && notForcedNotJavaScript then
-                                    let caseField = Definitions.SingletonUnionCase case.CompiledName
-                                    let expr = CopyCtor(typeDef, Object [ "$", Value (Int i) ])
-                                    let a = { A.MemberAnnotation.BasicPureJavaScript with Name = Some case.Name }
-                                    clsMembers.Add (NotResolvedMember.Method (caseField, (getUnresolved a N.Static false None expr)))
+                                if argumentless then
                                     SingletonFSharpUnionCase
                                 else
                                     NormalFSharpUnionCase (
@@ -1222,48 +1219,34 @@ let transformAssembly (logger: LoggerBase) (comp : Compilation) assemblyName (co
                     }
                 )
                 |> List.ofSeq |> FSharpRecordInfo    
-
-                //FST.GetRecordFields(t, Reflection.AllMethodsFlags)
-                //|> Seq.map (fun f ->
-                //    let annot = attrReader.GetMemberAnnot(tAnnot, f.GetCustomAttributesData()) 
-                //    let isOpt = 
-                //        annot.Kind = Some MemberKind.OptionalField 
-                //        && f.PropertyType.IsGenericType 
-                //        && f.PropertyType.GetGenericTypeDefinition() = typedefof<option<_>>
-                //    {
-                //        Name = f.Name
-                //        JSName = match annot.Name with Some n -> n | _ -> f.Name
-                //        RecordFieldType = Reflection.ReadType f.PropertyType
-                //        DateTimeFormat = annot.DateTimeFormat |> List.tryHead |> Option.map snd
-                //        Optional = isOpt
-                //        IsMutable = f.CanWrite
-                //    } : M.FSharpRecordFieldInfo
-                //)
-                //|> List.ofSeq |> M.FSharpRecordInfo
-
-                //CustomTypeInfo.FSharpRecordInfo 
-                //{
-                //    Name = f.Name
-                //    JSName = match annot.Name with Some n -> n | _ -> f.Name
-                //    RecordFieldType = Reflection.ReadType f.PropertyType
-                //    DateTimeFormat = annot.DateTimeFormat |> List.tryHead |> Option.map snd
-                //    Optional = isOpt
-                //    IsMutable = f.CanWrite
-                //} : CustomTypeInfo.FSharpRecordInfo
             else if entity.IsEnum then
                 CustomTypeInfo.EnumInfo typeDef
-            // Union
+            else if entity.IsDelegate then
+                let tparams = 
+                    entity.GenericParameters
+                    |> Seq.mapi (fun i p -> p.Name, i) |> Map.ofSeq
+                try 
+                    let sign = entity.FSharpDelegateSignature
+                    DelegateInfo {
+                        DelegateArgs =
+                            sign.DelegateArguments |> Seq.map (snd >> sr.ReadType tparams) |> List.ofSeq
+                        ReturnType = sr.ReadType tparams sign.DelegateReturnType
+                    }
+                with _ ->
+                    let inv = entity.MembersFunctionsAndValues |> Seq.find(fun m -> m.CompiledName = "Invoke")
+                    DelegateInfo {
+                        DelegateArgs =
+                            inv.CurriedParameterGroups |> Seq.concat |> Seq.map (fun p -> sr.ReadType tparams p.Type) |> List.ofSeq
+                        ReturnType = sr.ReadType tparams inv.ReturnParameter.Type
+                    }
             else
-                CustomTypeInfo.EnumInfo typeDef
+                CustomTypeInfo.NotCustomType 
 
         cls
         |> Option.map branchOnType
         |> Option.defaultValue CustomTypeInfo.NotCustomType
 
     comp.CustomTypesReflector <- reflectCustomType
-        
-    A.reflectCustomType
-
     comp.LookupTypeAttributes <- lookupTypeAttributes
     comp.LookupFieldAttributes <- lookupFieldAttributes 
     comp.LookupMethodAttributes <- lookupMethodAttributes
